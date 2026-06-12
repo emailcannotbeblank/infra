@@ -28,6 +28,8 @@ const (
 	// ReturnDelay is how long we wait before returning a slot to the reused pool,
 	// to let inflight requests on the previous sandbox drain and reduce reuse churn.
 	ReturnDelay = 3 * time.Second
+
+	defaultMountNamespaceTemplateKeepPaths = "/,/proc,/dev,/run,/sys,/etc,/bin,/sbin,/lib,/lib64,/usr,/home,/orchestrator,/fc-versions,/fc-kernels,/fc-vm"
 )
 
 var (
@@ -81,6 +83,13 @@ type Config struct {
 	SandboxTCPFirewallHTTPPort  uint16 `env:"SANDBOX_TCP_FIREWALL_HTTP_PORT"  envDefault:"5016"`
 	SandboxTCPFirewallTLSPort   uint16 `env:"SANDBOX_TCP_FIREWALL_TLS_PORT"   envDefault:"5017"`
 	SandboxTCPFirewallOtherPort uint16 `env:"SANDBOX_TCP_FIREWALL_OTHER_PORT" envDefault:"5018"`
+
+	// MountNamespaceTemplateKeepPaths is the comma-separated list of mount
+	// points kept in the mount namespace template copied for each sandbox.
+	MountNamespaceTemplateKeepPaths string `env:"MOUNT_NAMESPACE_TEMPLATE_KEEP_PATHS" envDefault:"/,/proc,/dev,/run,/sys,/etc,/bin,/sbin,/lib,/lib64,/usr,/home,/orchestrator,/fc-versions,/fc-kernels,/fc-vm"`
+	// MountNamespaceTemplatePruneDisabled keeps the template mount tree intact
+	// when set, which is useful for debugging missing mount dependencies.
+	MountNamespaceTemplatePruneDisabled bool `env:"MOUNT_NAMESPACE_TEMPLATE_PRUNE_DISABLED" envDefault:"false"`
 }
 
 func ParseConfig() (Config, error) {
@@ -100,6 +109,8 @@ type Pool struct {
 	reusedSlots chan *Slot
 
 	slotStorage Storage
+
+	mountNamespaces *mountNamespaceFactory
 }
 
 var ErrClosed = errors.New("cannot read from a closed pool")
@@ -107,6 +118,10 @@ var ErrClosed = errors.New("cannot read from a closed pool")
 func NewPool(newSlotsPoolSize, reusedSlotsPoolSize int, slotStorage Storage, config Config) *Pool {
 	newSlots := make(chan *Slot, newSlotsPoolSize-1)
 	reusedSlots := make(chan *Slot, reusedSlotsPoolSize)
+	templateKeepPaths := config.MountNamespaceTemplateKeepPaths
+	if templateKeepPaths == "" {
+		templateKeepPaths = defaultMountNamespaceTemplateKeepPaths
+	}
 
 	pool := &Pool{
 		config:      config,
@@ -114,6 +129,10 @@ func NewPool(newSlotsPoolSize, reusedSlotsPoolSize int, slotStorage Storage, con
 		newSlots:    newSlots,
 		reusedSlots: reusedSlots,
 		slotStorage: slotStorage,
+		mountNamespaces: newMountNamespaceFactory(
+			templateKeepPaths,
+			!config.MountNamespaceTemplatePruneDisabled,
+		),
 	}
 
 	return pool
@@ -198,6 +217,29 @@ func (p *Pool) Get(ctx context.Context, network *orchestrator.SandboxNetworkConf
 		return nil, fmt.Errorf("error setting slot internet access: %w", err)
 	}
 
+	mountNS, err := p.mountNamespaces.Create(ctx)
+	if err != nil {
+		go func() {
+			if returnErr := p.recycle(context.WithoutCancel(ctx), slot); returnErr != nil {
+				logger.L().Error(ctx, "failed to return slot to the pool after mount namespace create failure", zap.Error(returnErr), zap.Int("slot_index", slot.Idx))
+			}
+		}()
+
+		return nil, fmt.Errorf("error creating mount namespace: %w", err)
+	}
+
+	if err := slot.assignMountNamespace(mountNS); err != nil {
+		_ = mountNS.Close()
+
+		go func() {
+			if returnErr := p.recycle(context.WithoutCancel(ctx), slot); returnErr != nil {
+				logger.L().Error(ctx, "failed to return slot to the pool after mount namespace assign failure", zap.Error(returnErr), zap.Int("slot_index", slot.Idx))
+			}
+		}()
+
+		return nil, fmt.Errorf("error assigning mount namespace: %w", err)
+	}
+
 	return slot, nil
 }
 
@@ -238,6 +280,14 @@ func (p *Pool) Return(ctx context.Context, slot *Slot, releasedFn ReleaseNotify,
 // recycle resets the slot's internet configuration and puts it back into the
 // reused pool, or cleans it up if the pool is full or closed.
 func (p *Pool) recycle(ctx context.Context, slot *Slot) error {
+	if err := slot.releaseMountNamespace(); err != nil {
+		if cerr := p.cleanup(ctx, slot); cerr != nil {
+			return fmt.Errorf("release mount namespace: %w; cleanup: %w", err, cerr)
+		}
+
+		return fmt.Errorf("error releasing slot mount namespace: %w", err)
+	}
+
 	err := slot.ResetInternet(ctx)
 	if err != nil {
 		if cerr := p.cleanup(ctx, slot); cerr != nil {
@@ -300,7 +350,12 @@ func (p *Pool) recycle(ctx context.Context, slot *Slot) error {
 func (p *Pool) cleanup(ctx context.Context, slot *Slot) error {
 	var errs []error
 
-	err := slot.RemoveNetwork()
+	err := slot.releaseMountNamespace()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("cannot release mount namespace when releasing slot '%d': %w", slot.Idx, err))
+	}
+
+	err = slot.RemoveNetwork()
 	if err != nil {
 		errs = append(errs, fmt.Errorf("cannot remove network when releasing slot '%d': %w", slot.Idx, err))
 	}
@@ -327,6 +382,9 @@ func (p *Pool) Close(ctx context.Context) error {
 	p.closeMu.Unlock()
 
 	var errs []error
+	if err := p.mountNamespaces.Close(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to cleanup mount namespace factory: %w", err))
+	}
 
 	for slot := range p.newSlots {
 		newSlotsAvailableCounter.Add(ctx, -1)
